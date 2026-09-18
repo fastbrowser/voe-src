@@ -5,7 +5,8 @@ Voe is a toy proxying app I have made except the protocol is SOCKS-over-HTTP. Th
 ## Client
 * Download the client from releases or build from source
 * Make a config-client.yml in the same directory as the client.
-* Example: ```
+* Example:
+```
 server_url: ws://127.0.0.1:1234
 local_listen_addr: 127.0.0.1:1080
 username: username
@@ -18,7 +19,8 @@ secret_key: a-32-character-secret-key-for-encryption
 ## Server
 * Download the server from releases or build from source
 * Make a config-server.yml in the same directory as the server
-* Example: ```
+* Example: 
+```
 listen_addr: "0.0.0.0:1978"
 secret_key: "106282c922ff609da2547f00ea6bb79b"
 
