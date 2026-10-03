@@ -16,6 +16,7 @@ slint::slint! {
         in-out property <string> server_message: "";
         in-out property <bool> is_running: false;
         in-out property <bool> is_connected: false;
+        in-out property <bool> show_update: false;
 
         callback request_start();
         callback request_stop();
@@ -24,6 +25,7 @@ slint::slint! {
         callback secret_changed(string);
         callback toggle_password();
         callback toggle_secret();
+        callback request_update();
 
         title: "voe client " + root.version;
         width: 550px;
@@ -104,6 +106,12 @@ slint::slint! {
                     font-size: 14px;
                 }
 
+                if root.show_update : Button {
+                    text: "Update Now";
+                    width: 150px;
+                    clicked => { root.request_update(); }
+                }
+
                 HorizontalBox {
                     alignment: center;
                     spacing: 20px;
@@ -150,6 +158,21 @@ const PING_EVERY: Duration = Duration::from_secs(5);
 const LINK_TIMEOUT: Duration = Duration::from_secs(20);
 const SOCKS_FAIL: [u8; 10] = [0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 
+#[cfg(target_os = "windows")]
+const UPDATE_URL: &str =
+    "https://github.com/fastbrowser/voe-src/releases/latest/download/client-windows-x86_64.exe";
+#[cfg(all(target_os = "linux"))]
+const UPDATE_URL: &str =
+    "https://github.com/fastbrowser/voe-src/releases/latest/download/client-linux-x86_64";
+#[cfg(target_os = "macos")]
+const UPDATE_URL: &str =
+    "https://github.com/fastbrowser/voe-src/releases/latest/download/client-macos-x86_64";
+
+fn is_outdated(reason: &str) -> bool {
+    let lower = reason.to_lowercase();
+    lower.contains("outdated") || lower.contains("update")
+}
+
 #[derive(Clone)]
 struct Reporter {
     ui: slint::Weak<AppWindow>,
@@ -166,7 +189,11 @@ impl Reporter {
 
     fn message(&self, text: impl Into<String>) {
         let text: String = text.into();
-        let _ = self.ui.upgrade_in_event_loop(move |ui| ui.set_server_message(text.into()));
+        let outdated = is_outdated(&text);
+        let _ = self.ui.upgrade_in_event_loop(move |ui| {
+            ui.set_server_message(text.into());
+            ui.set_show_update(outdated);
+        });
     }
 
     fn finished(&self) {
@@ -536,6 +563,41 @@ async fn run_proxy(config: ClientConfig, mut stop_rx: watch::Receiver<bool>, rep
     rep.finished();
 }
 
+async fn self_update(rep: &Reporter) -> Result<(), String> {
+    rep.message("Downloading update...".to_string());
+
+    let bytes = reqwest::get(UPDATE_URL)
+        .await
+        .map_err(|e| format!("Download failed: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("Download failed: {e}"))?;
+
+    let current = std::env::current_exe().map_err(|e| e.to_string())?;
+    let tmp_new = current.with_extension("new");
+    let tmp_old = current.with_extension("old");
+
+    fs::write(&tmp_new, &bytes).map_err(|e| format!("Write failed: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&tmp_new).map_err(|e| e.to_string())?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&tmp_new, perms).map_err(|e| e.to_string())?;
+    }
+
+    let _ = fs::remove_file(&tmp_old);
+    fs::rename(&current, &tmp_old).map_err(|e| format!("Rename current failed: {e}"))?;
+    if let Err(e) = fs::rename(&tmp_new, &current) {
+        let _ = fs::rename(&tmp_old, &current); // rollback
+        return Err(format!("Rename new failed: {e}"));
+    }
+
+    std::process::Command::new(&current).spawn().ok();
+    std::process::exit(0);
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     let ui_handle = ui.as_weak();
@@ -612,6 +674,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             }
             ui.set_server_message("".into());
+            ui.set_show_update(false);
             ui.set_status("Connecting...".into());
             ui.set_is_running(true);
             stop_tx.send_replace(false);
@@ -645,6 +708,20 @@ fn main() -> Result<(), slint::PlatformError> {
                 secret_key: ui.get_secret_key().into(),
             };
             fs::write("config-client.yml", serde_yaml::to_string(&config).unwrap()).ok();
+        }
+    });
+
+    ui.on_request_update({
+        let ui_h = ui_handle.clone();
+        move || {
+            let ui = ui_h.unwrap();
+            ui.set_show_update(false);
+            let rep = Reporter { ui: ui_h.clone() };
+            tokio::spawn(async move {
+                if let Err(e) = self_update(&rep).await {
+                    rep.message(e);
+                }
+            });
         }
     });
 
