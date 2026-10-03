@@ -1,15 +1,38 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use aes_gcm::{aead::{Aead, KeyInit}};
+use aes_gcm::aead::{Aead, KeyInit};
 use rand::{RngCore, rngs::OsRng};
+pub mod mux;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const CTRL: u8 = 0xC0;
+pub const CTRL_SID: u32 = 0;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct User {
     pub username: String,
     pub password: String,
     pub display_name: String,
-    pub max_kbps: Option<u32>, 
+    pub max_kbps: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ShareBanConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ban_minutes")]
+    pub duration_minutes: u64,
+}
+
+fn default_ban_minutes() -> u64 {
+    20
+}
+
+impl Default for ShareBanConfig {
+    fn default() -> Self {
+        Self { enabled: false, duration_minutes: default_ban_minutes() }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -17,6 +40,8 @@ pub struct ServerConfig {
     pub listen_addr: String,
     pub secret_key: String,
     pub users: Vec<User>,
+    #[serde(default)]
+    pub share_ban: ShareBanConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -29,13 +54,18 @@ pub struct ClientConfig {
 }
 
 pub fn encode(text: &str) -> String {
-    if text.is_empty() { return "".to_string(); }
+    if text.is_empty() {
+        return "".to_string();
+    }
     let input_bytes = text.as_bytes();
     let mut result = String::with_capacity(input_bytes.len() * 2);
     for (i, &b_orig) in input_bytes.iter().enumerate() {
         let mut b = b_orig as u8;
-        if i % 2 == 0 { b ^= ((i * 33 + 7) & 0xFF) as u8; } 
-        else { b = (b ^ 0xFF) ^ ((i * 13 + 3) & 0xFF) as u8; }
+        if i % 2 == 0 {
+            b ^= ((i * 33 + 7) & 0xFF) as u8;
+        } else {
+            b = (b ^ 0xFF) ^ ((i * 13 + 3) & 0xFF) as u8;
+        }
         let high_nibble = (b & 0xF0) >> 4;
         let low_nibble = (b & 0x0F) << 4;
         b = high_nibble | low_nibble;
@@ -46,7 +76,9 @@ pub fn encode(text: &str) -> String {
 }
 
 pub fn decode(hex_str: &str) -> String {
-    if hex_str.is_empty() { return "".to_string(); }
+    if hex_str.is_empty() {
+        return "".to_string();
+    }
     let bytes = hex::decode(hex_str).unwrap_or_default();
     let mut decoded_bytes = Vec::with_capacity(bytes.len());
     for (idx, &byte_val) in bytes.iter().enumerate() {
@@ -55,8 +87,11 @@ pub fn decode(hex_str: &str) -> String {
         let high_nibble = (b & 0xF0) >> 4;
         let low_nibble = (b & 0x0F) << 4;
         b = high_nibble | low_nibble;
-        if idx % 2 == 0 { b ^= ((idx * 33 + 7) & 0xFF) as u8; } 
-        else { b = (b ^ ((idx * 13 + 3) & 0xFF) as u8) ^ 0xFF; }
+        if idx % 2 == 0 {
+            b ^= ((idx * 33 + 7) & 0xFF) as u8;
+        } else {
+            b = (b ^ ((idx * 13 + 3) & 0xFF) as u8) ^ 0xFF;
+        }
         decoded_bytes.push(b);
     }
     String::from_utf8_lossy(&decoded_bytes).into_owned()
@@ -75,12 +110,27 @@ pub fn encrypt_data(key_str: &str, plaintext: &[u8]) -> Vec<u8> {
 }
 
 pub fn decrypt_data(key_str: &str, ciphertext_with_nonce: &[u8]) -> Option<Vec<u8>> {
-    if ciphertext_with_nonce.len() < 12 { return None; }
+    if ciphertext_with_nonce.len() < 12 {
+        return None;
+    }
     let key = Key::<Aes256Gcm>::from_slice(key_str.as_bytes());
     let cipher = Aes256Gcm::new(key);
     let (nonce_bytes, ciphertext) = ciphertext_with_nonce.split_at(12);
     let nonce = Nonce::from_slice(nonce_bytes);
     cipher.decrypt(nonce, ciphertext).ok()
+}
+
+pub fn ctrl_frame(key_str: &str, text: &str) -> Vec<u8> {
+    encrypt_data(key_str, &mux::encode_frame(CTRL_SID, CTRL, text.as_bytes()))
+}
+
+pub fn decode_ctrl(key_str: &str, enc: &[u8]) -> Option<String> {
+    let raw = decrypt_data(key_str, enc)?;
+    let (_, kind, payload) = mux::decode_frame(&raw)?;
+    if kind != CTRL {
+        return None;
+    }
+    Some(String::from_utf8_lossy(payload).into_owned())
 }
 
 pub fn load_config<T: for<'de> Deserialize<'de>>(path: &str) -> T {
