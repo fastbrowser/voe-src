@@ -28,6 +28,7 @@ use crossterm::{
 };
 
 type WsSink = SplitSink<WebSocketStream<TcpStream>, Message>;
+type KeyLimiters = (Arc<AsyncMutex<RateLimiter>>, Arc<AsyncMutex<RateLimiter>>); // (rx, tx)
 
 const STALE_AFTER: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,39 +42,40 @@ enum EventMsg {
 struct UserSession {
     name: String,
     username: String,
+    /// Current throughput in kilobits per second (payload only).
     current_kbps: f64,
     total_bytes: usize,
+    window_bytes: usize,
     kill_switch: Arc<Mutex<Option<String>>>,
     last_seen: Arc<Mutex<Instant>>,
     msg_tx: mpsc::UnboundedSender<String>,
 }
 
+/// Deadline-based limiter. `kbps` is real kilobits per second (1 kbit = 125 bytes).
 struct RateLimiter {
-    bytes_per_sec: u32,
-    bytes_sent_this_window: usize,
-    last_window_start: Instant,
+    bytes_per_sec: f64,
+    next_free: Instant,
 }
 
 impl RateLimiter {
     fn new(kbps: u32) -> Self {
         Self {
-            bytes_per_sec: kbps.saturating_mul(1024),
-            bytes_sent_this_window: 0,
-            last_window_start: Instant::now(),
+            bytes_per_sec: kbps as f64 * 125.0,
+            next_free: Instant::now(),
         }
     }
 
     async fn limit(&mut self, amount: usize) {
-        if self.bytes_per_sec == 0 {
+        if self.bytes_per_sec == 0.0 {
             return;
         }
-        self.bytes_sent_this_window += amount;
-        let elapsed = self.last_window_start.elapsed();
-        if elapsed.as_secs() >= 1 {
-            self.bytes_sent_this_window = 0;
-            self.last_window_start = Instant::now();
-        } else if self.bytes_sent_this_window > self.bytes_per_sec as usize {
-            sleep(Duration::from_millis(50)).await;
+        let now = Instant::now();
+        // Allow catching up on lost time, but cap the burst at 100 ms.
+        let floor = now.checked_sub(Duration::from_millis(100)).unwrap_or(now);
+        let start = self.next_free.max(floor);
+        self.next_free = start + Duration::from_secs_f64(amount as f64 / self.bytes_per_sec);
+        if self.next_free > now {
+            sleep(self.next_free - now).await;
         }
     }
 }
@@ -100,6 +102,7 @@ fn try_admit(
     share_ban: &ShareBanConfig,
     id: usize,
     username: &str,
+    allow_sharing: bool,
     grace_over: bool,
     make_session: impl FnOnce() -> UserSession,
 ) -> Admit {
@@ -107,7 +110,7 @@ fn try_admit(
     let mut b = bans.lock().unwrap();
     let mut s = sessions.lock().unwrap();
 
-    if share_ban.enabled {
+    if share_ban.enabled && !allow_sharing {
         if let Some(until) = b.get(username).copied() {
             if now < until {
                 let mins = (until.saturating_duration_since(now).as_secs() + 59) / 60;
@@ -156,6 +159,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sessions_clone = Arc::clone(&sessions);
     let bans_clone = Arc::clone(&bans);
+
+    // One rx/tx limiter pair per key, shared by every connection using that key.
+    let limiters: Arc<HashMap<String, KeyLimiters>> = Arc::new(
+        config
+            .users
+            .iter()
+            .map(|u| {
+                let kbps = u.max_kbps.unwrap_or(u32::MAX);
+                (
+                    u.username.clone(),
+                    (
+                        Arc::new(AsyncMutex::new(RateLimiter::new(kbps))),
+                        Arc::new(AsyncMutex::new(RateLimiter::new(kbps))),
+                    ),
+                )
+            })
+            .collect(),
+    );
+    let limiters_clone = Arc::clone(&limiters);
     let tx_clone = tx.clone();
     let cfg = config.clone();
 
@@ -171,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tx_inner = tx_clone.clone();
             let sessions_inner = Arc::clone(&sessions_clone);
             let bans_inner = Arc::clone(&bans_clone);
+            let limiters_inner = Arc::clone(&limiters_clone);
 
             tokio::spawn(async move {
                 let ws_stream = match accept_async(stream).await {
@@ -232,12 +255,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &cfg_inner.share_ban,
                         current_id,
                         &user.username,
+                        user.allow_sharing,
                         grace_over,
                         || UserSession {
                             name: user.display_name.clone(),
                             username: user.username.clone(),
                             current_kbps: 0.0,
                             total_bytes: 0,
+                            window_bytes: 0,
                             kill_switch: Arc::clone(&kill_switch),
                             last_seen: Arc::clone(&last_seen),
                             msg_tx: msg_tx.clone(),
@@ -259,9 +284,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .send(EventMsg::Connected { id: current_id, name: user.display_name.clone() })
                     .await;
 
-                let kbps = user.max_kbps.unwrap_or(u32::MAX);
-                let rx_limiter = Arc::new(AsyncMutex::new(RateLimiter::new(kbps)));
-                let tx_limiter = Arc::new(AsyncMutex::new(RateLimiter::new(kbps)));
+                let (rx_limiter, tx_limiter) = limiters_inner
+                    .get(&user.username)
+                    .cloned()
+                    .expect("limiters exist for every configured user");
 
                 let routes: Arc<Mutex<HashMap<u32, StreamTx>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -292,8 +318,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *last_seen_clone.lock().unwrap() = Instant::now();
 
                     let enc = msg.into_data();
-                    rx_limiter.lock().await.limit(enc.len()).await;
-                    let _ = tx_inner.send(EventMsg::Traffic { id: current_id, bytes: enc.len() }).await;
 
                     let raw = match decrypt_data(&cfg_inner.secret_key, &enc) {
                         Some(d) => d,
@@ -303,6 +327,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Some(f) => f,
                         None => continue,
                     };
+
+                    // Upload accounting + limiting: payload bytes of DATA frames only.
+                    if kind == DATA {
+                        rx_limiter.lock().await.limit(payload.len()).await;
+                        let _ = tx_inner
+                            .send(EventMsg::Traffic { id: current_id, bytes: payload.len() })
+                            .await;
+                    }
 
                     match kind {
                         CTRL => {
@@ -370,6 +402,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 match tcp_read.read(&mut buf).await {
                                                     Ok(0) | Err(_) => break,
                                                     Ok(n) => {
+                                                        // Download accounting + limiting: payload bytes.
                                                         tx_limiter.lock().await.limit(n).await;
                                                         let _ = tx_inner2
                                                             .send(EventMsg::Traffic { id: current_id, bytes: n })
@@ -427,7 +460,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut selected_index: usize = 0;
-    let mut tick_count = 0; 
+    let mut last_rate = Instant::now();
     let mut compose: Option<(Option<usize>, String)> = None;
 
     loop {
@@ -453,10 +486,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut list_items = Vec::new();
             for (i, (id, session)) in sorted_sessions.iter().enumerate() {
-                let speed = if session.current_kbps > 1024.0 {
-                    format!("{:.2} MBps", session.current_kbps / 1024.0)
+                let speed = if session.current_kbps >= 1000.0 {
+                    format!("{:.2} Mbps", session.current_kbps / 1000.0)
                 } else {
-                    format!("{:.2} KBps", session.current_kbps)
+                    format!("{:.0} kbps", session.current_kbps)
                 };
 
                 let text = format!(
@@ -587,18 +620,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 EventMsg::Traffic { id, bytes } => {
                     if let Some(session) = s.get_mut(&id) {
                         session.total_bytes += bytes;
-                        session.current_kbps = (bytes as f64 / 1024.0) * 10.0;
+                        session.window_bytes += bytes;
                     }
                 }
             }
         }
 
-        tick_count += 1;
-        if tick_count % 10 == 0 {
+        if last_rate.elapsed() >= Duration::from_secs(1) {
+            let secs = last_rate.elapsed().as_secs_f64();
             let mut s = sessions.lock().unwrap();
             for session in s.values_mut() {
-                session.current_kbps *= 0.9;
+                // kilobits per second
+                session.current_kbps = session.window_bytes as f64 * 8.0 / 1000.0 / secs;
+                session.window_bytes = 0;
             }
+            last_rate = Instant::now();
         }
     }
 

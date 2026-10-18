@@ -1,5 +1,5 @@
 slint::slint! {
-    import { Button, LineEdit, VerticalBox, HorizontalBox } from "std-widgets.slint";
+    import { Button, LineEdit, VerticalBox, HorizontalBox, CheckBox } from "std-widgets.slint";
 
     export component AppWindow inherits Window {
         in property <string> version: "";
@@ -17,6 +17,7 @@ slint::slint! {
         in-out property <bool> is_running: false;
         in-out property <bool> is_connected: false;
         in-out property <bool> show_update: false;
+        in-out property <bool> adblock: true;
 
         callback request_start();
         callback request_stop();
@@ -26,10 +27,11 @@ slint::slint! {
         callback toggle_password();
         callback toggle_secret();
         callback request_update();
+        callback adblock_toggled(bool);
 
         title: "voe client " + root.version;
         width: 550px;
-        height: 660px;
+        height: 700px;
         background: #1e1e1e;
 
         Flickable {
@@ -91,6 +93,12 @@ slint::slint! {
                     }
                 }
 
+                CheckBox {
+                    text: "Ad blocker";
+                    checked <=> root.adblock;
+                    toggled => { root.adblock_toggled(self.checked); }
+                }
+
                 Text {
                     text: "Status: " + root.status;
                     color: root.is_connected ? #00ff00 : #ff4444;
@@ -133,7 +141,7 @@ slint::slint! {
 
 use std::collections::HashMap;
 use std::fs;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
@@ -157,6 +165,7 @@ type StreamMsg = (u8, Vec<u8>);
 const PING_EVERY: Duration = Duration::from_secs(5);
 const LINK_TIMEOUT: Duration = Duration::from_secs(20);
 const SOCKS_FAIL: [u8; 10] = [0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+const SOCKS_REFUSED: [u8; 10] = [0x05, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 
 #[cfg(target_os = "windows")]
 const UPDATE_URL: &str =
@@ -445,7 +454,18 @@ async fn supervise(
     }
 }
 
-async fn handle_socks(mut stream: TcpStream, mut link_rx: watch::Receiver<Link>) {
+fn socks_host(req: &[u8]) -> Option<&str> {
+    if req.len() < 5 || req[3] != 0x03 {
+        return None;
+    }
+    let end = 5 + req[4] as usize;
+    if req.len() < end {
+        return None;
+    }
+    std::str::from_utf8(&req[5..end]).ok()
+}
+
+async fn handle_socks(mut stream: TcpStream, mut link_rx: watch::Receiver<Link>, adblock: Arc<AtomicBool>) {
     stream.set_nodelay(true).ok();
 
     let mut buf = [0u8; 1024];
@@ -460,6 +480,15 @@ async fn handle_socks(mut stream: TcpStream, mut link_rx: watch::Receiver<Link>)
         Ok(n) if n >= 4 && buf[1] == 0x01 => n,
         _ => return,
     };
+
+    if adblock.load(Ordering::Relaxed) {
+        if let Some(host) = socks_host(&buf[..n]) {
+            if voe::adblock::is_blocked(host) {
+                stream.write_all(&SOCKS_REFUSED).await.ok();
+                return;
+            }
+        }
+    }
 
     let wait_link = async {
         loop {
@@ -537,22 +566,22 @@ async fn handle_socks(mut stream: TcpStream, mut link_rx: watch::Receiver<Link>)
     mux.deregister(sid);
 }
 
-async fn accept_loop(listener: TcpListener, link_rx: watch::Receiver<Link>) {
+async fn accept_loop(listener: TcpListener, link_rx: watch::Receiver<Link>, adblock: Arc<AtomicBool>) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(handle_socks(stream, link_rx.clone()));
+                tokio::spawn(handle_socks(stream, link_rx.clone(), Arc::clone(&adblock)));
             }
             Err(_) => sleep(Duration::from_millis(50)).await,
         }
     }
 }
 
-async fn run_proxy(config: ClientConfig, mut stop_rx: watch::Receiver<bool>, rep: Reporter) {
+async fn run_proxy(config: ClientConfig, mut stop_rx: watch::Receiver<bool>, rep: Reporter, adblock: Arc<AtomicBool>) {
     match TcpListener::bind(&config.local_listen_addr).await {
         Ok(listener) => {
             let (link_tx, link_rx) = watch::channel::<Link>(None);
-            let accept_task = tokio::spawn(accept_loop(listener, link_rx));
+            let accept_task = tokio::spawn(accept_loop(listener, link_rx, adblock));
             supervise(&config, &link_tx, &mut stop_rx, &rep).await;
             accept_task.abort();
         }
@@ -657,9 +686,16 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let (stop_tx, _stop_rx) = watch::channel(false);
 
+    let adblock = Arc::new(AtomicBool::new(true));
+    ui.on_adblock_toggled({
+        let adblock = Arc::clone(&adblock);
+        move |v| adblock.store(v, Ordering::Relaxed)
+    });
+
     ui.on_request_start({
         let ui_h = ui_handle.clone();
         let stop_tx = stop_tx.clone();
+        let adblock = Arc::clone(&adblock);
         move || {
             let ui = ui_h.unwrap();
             let config = ClientConfig {
@@ -680,8 +716,9 @@ fn main() -> Result<(), slint::PlatformError> {
             stop_tx.send_replace(false);
             let stop_rx = stop_tx.subscribe();
             let rep = Reporter { ui: ui_h.clone() };
+            let adblock = Arc::clone(&adblock);
             tokio::spawn(async move {
-                run_proxy(config, stop_rx, rep).await;
+                run_proxy(config, stop_rx, rep, adblock).await;
             });
         }
     });

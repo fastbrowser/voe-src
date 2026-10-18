@@ -4,6 +4,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use aes_gcm::aead::{Aead, KeyInit};
 use rand::{RngCore, rngs::OsRng};
 pub mod mux;
+pub mod adblock;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CTRL: u8 = 0xC0;
@@ -15,6 +16,11 @@ pub struct User {
     pub password: String,
     pub display_name: String,
     pub max_kbps: Option<u32>,
+    /// Optional. Defaults to false. When true, the key may be used by any number
+    /// of clients at once (no share-ban, no "replaced by newer connection" kick)
+    /// and `max_kbps` is shared between all of them.
+    #[serde(default)]
+    pub allow_sharing: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
