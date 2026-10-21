@@ -42,7 +42,6 @@ enum EventMsg {
 struct UserSession {
     name: String,
     username: String,
-    /// Current throughput in kilobits per second (payload only).
     current_kbps: f64,
     total_bytes: usize,
     window_bytes: usize,
@@ -51,7 +50,6 @@ struct UserSession {
     msg_tx: mpsc::UnboundedSender<String>,
 }
 
-/// Deadline-based limiter. `kbps` is real kilobits per second (1 kbit = 125 bytes).
 struct RateLimiter {
     bytes_per_sec: f64,
     next_free: Instant,
@@ -70,7 +68,6 @@ impl RateLimiter {
             return;
         }
         let now = Instant::now();
-        // Allow catching up on lost time, but cap the burst at 100 ms.
         let floor = now.checked_sub(Duration::from_millis(100)).unwrap_or(now);
         let start = self.next_free.max(floor);
         self.next_free = start + Duration::from_secs_f64(amount as f64 / self.bytes_per_sec);
@@ -160,7 +157,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sessions_clone = Arc::clone(&sessions);
     let bans_clone = Arc::clone(&bans);
 
-    // One rx/tx limiter pair per key, shared by every connection using that key.
     let limiters: Arc<HashMap<String, KeyLimiters>> = Arc::new(
         config
             .users
@@ -328,7 +324,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None => continue,
                     };
 
-                    // Upload accounting + limiting: payload bytes of DATA frames only.
                     if kind == DATA {
                         rx_limiter.lock().await.limit(payload.len()).await;
                         let _ = tx_inner
@@ -402,7 +397,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 match tcp_read.read(&mut buf).await {
                                                     Ok(0) | Err(_) => break,
                                                     Ok(n) => {
-                                                        // Download accounting + limiting: payload bytes.
                                                         tx_limiter.lock().await.limit(n).await;
                                                         let _ = tx_inner2
                                                             .send(EventMsg::Traffic { id: current_id, bytes: n })
@@ -630,7 +624,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let secs = last_rate.elapsed().as_secs_f64();
             let mut s = sessions.lock().unwrap();
             for session in s.values_mut() {
-                // kilobits per second
                 session.current_kbps = session.window_bytes as f64 * 8.0 / 1000.0 / secs;
                 session.window_bytes = 0;
             }

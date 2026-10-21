@@ -4,12 +4,11 @@ slint::slint! {
     export component AppWindow inherits Window {
         in property <string> version: "";
         in-out property <string> server_url: "";
+        in-out property <string> remote_url: "";
         in-out property <string> local_addr: "";
         in-out property <string> username: "";
         in-out property <string> password: "";
         in-out property <string> secret_key: "";
-        in-out property <string> password_display: "";
-        in-out property <string> secret_display: "";
         in-out property <bool> show_password: false;
         in-out property <bool> show_secret: false;
         in-out property <string> status: "Stopped";
@@ -22,16 +21,12 @@ slint::slint! {
         callback request_start();
         callback request_stop();
         callback request_save();
-        callback password_changed(string);
-        callback secret_changed(string);
-        callback toggle_password();
-        callback toggle_secret();
         callback request_update();
         callback adblock_toggled(bool);
 
         title: "voe client " + root.version;
         width: 550px;
-        height: 700px;
+        height: 760px;
         background: #1e1e1e;
 
         Flickable {
@@ -49,8 +44,21 @@ slint::slint! {
 
                 VerticalBox {
                     spacing: 5px;
-                    Text { text: "Server URL"; color: #aaa; }
-                    LineEdit { text: root.server_url; edited(text) => { root.server_url = text; } }
+                    Text {
+                        text: "Server URL";
+                        color: root.remote_url == "" ? #aaa : #555;
+                    }
+                    LineEdit {
+                        enabled: root.remote_url == "";
+                        text: root.server_url;
+                        edited(text) => { root.server_url = text; }
+                    }
+                }
+
+                VerticalBox {
+                    spacing: 5px;
+                    Text { text: "Remote URL (optional - get server url from here)"; color: #aaa; font-size: 11px; wrap: word-wrap; }
+                    LineEdit { text: root.remote_url; edited(text) => { root.remote_url = text; } }
                 }
 
                 VerticalBox {
@@ -70,12 +78,15 @@ slint::slint! {
                     VerticalBox {
                         spacing: 2px;
                         Text { text: "Password"; color: #aaa; font-size: 12px; }
-                        LineEdit { text: root.password_display; edited(text) => { root.password_changed(text); } }
+                        LineEdit {
+                            text <=> root.password;
+                            input-type: root.show_password ? InputType.text : InputType.password;
+                        }
                     }
                     Button {
                         text: root.show_password ? "Hide" : "Show";
                         width: 60px;
-                        clicked => { root.toggle_password(); }
+                        clicked => { root.show_password = !root.show_password; }
                     }
                 }
 
@@ -84,12 +95,15 @@ slint::slint! {
                     VerticalBox {
                         spacing: 2px;
                         Text { text: "Secret Key (32 chars)"; color: #aaa; font-size: 12px; }
-                        LineEdit { text: root.secret_display; edited(text) => { root.secret_changed(text); } }
+                        LineEdit {
+                            text <=> root.secret_key;
+                            input-type: root.show_secret ? InputType.text : InputType.password;
+                        }
                     }
                     Button {
                         text: root.show_secret ? "Hide" : "Show";
                         width: 60px;
-                        clicked => { root.toggle_secret(); }
+                        clicked => { root.show_secret = !root.show_secret; }
                     }
                 }
 
@@ -155,7 +169,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
 use voe::mux::{decode_frame, encode_frame, CLOSE, DATA, OPEN, OPEN_OK};
-use voe::{ctrl_frame, decode_ctrl, decrypt_data, encode, encrypt_data, load_config, ClientConfig, CTRL, VERSION};
+use voe::{ctrl_frame, decode_ctrl, decrypt_data, encode, encrypt_data, ClientConfig, CTRL, VERSION};
 
 type WsStream = tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type WsSink = SplitSink<WsStream, Message>;
@@ -166,6 +180,7 @@ const PING_EVERY: Duration = Duration::from_secs(5);
 const LINK_TIMEOUT: Duration = Duration::from_secs(20);
 const SOCKS_FAIL: [u8; 10] = [0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 const SOCKS_REFUSED: [u8; 10] = [0x05, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+const CONFIG_PATH: &str = "config-client.yml";
 
 #[cfg(target_os = "windows")]
 const UPDATE_URL: &str =
@@ -180,6 +195,52 @@ const UPDATE_URL: &str =
 fn is_outdated(reason: &str) -> bool {
     let lower = reason.to_lowercase();
     lower.contains("outdated") || lower.contains("update")
+}
+
+fn blank_config() -> ClientConfig {
+    ClientConfig {
+        server_url: String::new(),
+        local_listen_addr: String::new(),
+        username: String::new(),
+        password: String::new(),
+        secret_key: String::new(),
+        remote_url_source: None,
+    }
+}
+
+fn load_config_safe(path: &str) -> (ClientConfig, bool) {
+    if !std::path::Path::new(path).exists() {
+        return (blank_config(), true);
+    }
+    match fs::read_to_string(path) {
+        Ok(contents) => match serde_yaml::from_str::<ClientConfig>(&contents) {
+            Ok(cfg) => (cfg, false),
+            Err(_) => (blank_config(), true),
+        },
+        Err(_) => (blank_config(), true),
+    }
+}
+
+fn save_config(config: &ClientConfig) {
+    if let Ok(yaml) = serde_yaml::to_string(config) {
+        let _ = fs::write(CONFIG_PATH, yaml);
+    }
+}
+
+async fn resolve_server_url(config: &ClientConfig) -> String {
+    if let Some(url) = &config.remote_url_source {
+        let url = url.trim();
+        if !url.is_empty() {
+            if let Ok(Ok(resp)) = timeout(Duration::from_secs(10), reqwest::get(url)).await {
+                if let Ok(text) = resp.text().await {
+                    if let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) {
+                        return line.to_string();
+                    }
+                }
+            }
+        }
+    }
+    config.server_url.clone()
 }
 
 #[derive(Clone)]
@@ -231,7 +292,9 @@ struct MuxClient {
 
 impl MuxClient {
     async fn connect(config: &ClientConfig, rep: Reporter) -> Result<Self, ConnectError> {
-        let (ws, _) = match timeout(Duration::from_secs(10), connect_async(&config.server_url)).await {
+        let server_url = resolve_server_url(config).await;
+
+        let (ws, _) = match timeout(Duration::from_secs(10), connect_async(&server_url)).await {
             Ok(Ok(v)) => v,
             _ => return Err(ConnectError::Failed),
         };
@@ -627,62 +690,35 @@ async fn self_update(rep: &Reporter) -> Result<(), String> {
     std::process::exit(0);
 }
 
+fn ui_to_config(ui: &AppWindow) -> ClientConfig {
+    let remote = ui.get_remote_url().to_string();
+    ClientConfig {
+        server_url: ui.get_server_url().into(),
+        local_listen_addr: ui.get_local_addr().into(),
+        username: ui.get_username().into(),
+        password: ui.get_password().into(),
+        secret_key: ui.get_secret_key().into(),
+        remote_url_source: if remote.trim().is_empty() { None } else { Some(remote) },
+    }
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     let ui_handle = ui.as_weak();
-    let initial_cfg = load_config::<ClientConfig>("config-client.yml");
+    let (initial_cfg, first_run) = load_config_safe(CONFIG_PATH);
     ui.set_version(VERSION.into());
     ui.set_server_url(initial_cfg.server_url.clone().into());
+    ui.set_remote_url(initial_cfg.remote_url_source.clone().unwrap_or_default().into());
     ui.set_local_addr(initial_cfg.local_listen_addr.clone().into());
     ui.set_username(initial_cfg.username.clone().into());
     ui.set_password(initial_cfg.password.clone().into());
     ui.set_secret_key(initial_cfg.secret_key.clone().into());
-    ui.set_password_display("●".repeat(initial_cfg.password.len()).into());
-    ui.set_secret_display("●".repeat(initial_cfg.secret_key.len()).into());
 
-    let ui_t = ui.as_weak();
-    ui.on_toggle_password(move || {
-        let ui = ui_t.unwrap();
-        let show = !ui.get_show_password();
-        ui.set_show_password(show);
-        if show {
-            ui.set_password_display(ui.get_password().into());
-        } else {
-            ui.set_password_display("●".repeat(ui.get_password().len()).into());
-        }
-    });
-
-    let ui_s = ui.as_weak();
-    ui.on_toggle_secret(move || {
-        let ui = ui_s.unwrap();
-        let show = !ui.get_show_secret();
-        ui.set_show_secret(show);
-        if show {
-            ui.set_secret_display(ui.get_secret_key().into());
-        } else {
-            ui.set_secret_display("●".repeat(ui.get_secret_key().len()).into());
-        }
-    });
-
-    let ui_p = ui.as_weak();
-    ui.on_password_changed(move |text| {
-        let ui = ui_p.unwrap();
-        let val = text.to_string();
-        ui.set_password(val.clone().into());
-        if !ui.get_show_password() {
-            ui.set_password_display("●".repeat(val.len()).into());
-        }
-    });
-
-    let ui_sk = ui.as_weak();
-    ui.on_secret_changed(move |text| {
-        let ui = ui_sk.unwrap();
-        let val = text.to_string();
-        ui.set_secret_key(val.clone().into());
-        if !ui.get_show_secret() {
-            ui.set_secret_display("●".repeat(val.len()).into());
-        }
-    });
+    if first_run {
+        ui.set_server_message(
+            "No config found. Fill in the fields above, then click \"Save Config\" and \"Start Proxy\".".into(),
+        );
+    }
 
     let (stop_tx, _stop_rx) = watch::channel(false);
 
@@ -698,17 +734,22 @@ fn main() -> Result<(), slint::PlatformError> {
         let adblock = Arc::clone(&adblock);
         move || {
             let ui = ui_h.unwrap();
-            let config = ClientConfig {
-                server_url: ui.get_server_url().into(),
-                local_listen_addr: ui.get_local_addr().into(),
-                username: ui.get_username().into(),
-                password: ui.get_password().into(),
-                secret_key: ui.get_secret_key().into(),
-            };
+            let config = ui_to_config(&ui);
+
+            if config.server_url.trim().is_empty() && config.remote_url_source.is_none() {
+                ui.set_server_message("Please fill in a Server URL or a Remote URL.".into());
+                return;
+            }
+            if config.local_listen_addr.trim().is_empty() || config.username.trim().is_empty() {
+                ui.set_server_message("Please fill in local listen address and username.".into());
+                return;
+            }
             if config.secret_key.len() != 32 {
                 ui.set_server_message("Secret key must be exactly 32 characters.".into());
                 return;
             }
+
+            save_config(&config);
             ui.set_server_message("".into());
             ui.set_show_update(false);
             ui.set_status("Connecting...".into());
@@ -737,14 +778,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let ui_h = ui_handle.clone();
         move || {
             let ui = ui_h.unwrap();
-            let config = ClientConfig {
-                server_url: ui.get_server_url().into(),
-                local_listen_addr: ui.get_local_addr().into(),
-                username: ui.get_username().into(),
-                password: ui.get_password().into(),
-                secret_key: ui.get_secret_key().into(),
-            };
-            fs::write("config-client.yml", serde_yaml::to_string(&config).unwrap()).ok();
+            save_config(&ui_to_config(&ui));
         }
     });
 

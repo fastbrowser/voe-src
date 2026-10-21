@@ -16,9 +16,6 @@ pub struct User {
     pub password: String,
     pub display_name: String,
     pub max_kbps: Option<u32>,
-    /// Optional. Defaults to false. When true, the key may be used by any number
-    /// of clients at once (no share-ban, no "replaced by newer connection" kick)
-    /// and `max_kbps` is shared between all of them.
     #[serde(default)]
     pub allow_sharing: bool,
 }
@@ -57,6 +54,8 @@ pub struct ClientConfig {
     pub username: String,
     pub password: String,
     pub secret_key: String,
+    #[serde(default)]
+    pub remote_url_source: Option<String>,
 }
 
 pub fn encode(text: &str) -> String {
